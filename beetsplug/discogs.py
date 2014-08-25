@@ -17,9 +17,11 @@ discogs-client library.
 """
 from beets.autotag.hooks import AlbumInfo, TrackInfo, Distance
 from beets.plugins import BeetsPlugin
-from discogs_client import Release, Client
+#from discogs_client import DiscogsAPIError, Release, Search
 from discogs_client.exceptions import DiscogsAPIError
+from discogs_client.models import Release
 import beets
+import discogs_client
 import logging
 import re
 import time
@@ -30,6 +32,10 @@ log = logging.getLogger('beets')
 urllib3_logger = logging.getLogger('requests.packages.urllib3')
 urllib3_logger.setLevel(logging.CRITICAL)
 
+# Set user-agent for discogs client.
+d = discogs_client.Client('beets/%s +http://beets.radbox.org/' % \
+    beets.__version__)
+
 
 class DiscogsPlugin(BeetsPlugin):
 
@@ -38,8 +44,6 @@ class DiscogsPlugin(BeetsPlugin):
         self.config.add({
             'source_weight': 0.5,
         })
-        self.discogs_client = Client('beets/%s +http://beets.radbox.org/' %
-                                     beets.__version__)
 
     def album_distance(self, items, album_info, mapping):
         """Returns the album distance.
@@ -76,7 +80,7 @@ class DiscogsPlugin(BeetsPlugin):
                           album_id)
         if not match:
             return None
-        result = Release(self.discogs_client, {'id': int(match.group(2))})
+        result = d.release(match.group(2))
         # Try to obtain title to verify that we indeed have a valid Release
         try:
             getattr(result, 'title')
@@ -94,36 +98,41 @@ class DiscogsPlugin(BeetsPlugin):
         # cause a query to return no results, even if they match the artist or
         # album title. Use `re.UNICODE` flag to avoid stripping non-english
         # word characters.
-        query = re.sub(r'(?u)\W+', ' ', query).encode('utf8')
+        query = re.sub(r'(?u)\W+', ' ', query)
         # Strip medium information from query, Things like "CD1" and "disk 1"
         # can also negate an otherwise positive result.
         query = re.sub(r'(?i)\b(CD|disc)\s*\d+', '', query)
-        releases = self.discogs_client.search(query, type='release').page(1)
-        return [self.get_album_info(release) for release in releases[:5]]
+        albums = []
+        for result in d.search(query, type='release'):
+            if isinstance(result, Release):
+                albums.append(self.get_album_info(result))
+            if len(albums) >= 5:
+                break
+        return albums
 
     def get_album_info(self, result):
         """Returns an AlbumInfo object for a discogs Release object.
         """
-        artist, artist_id = self.get_artist([a.data for a in result.artists])
         album = re.sub(r' +', ' ', result.title)
-        album_id = result.data['id']
+        album_id = result.id
+        artist, artist_id = self.get_artist(result.artists)
         # Use `.data` to access the tracklist directly instead of the
         # convenient `.tracklist` property, which will strip out useful artist
         # information and leave us with skeleton `Artist` objects that will
         # each make an API call just to get the same data back.
-        tracks = self.get_tracks(result.data['tracklist'])
+        tracks = self.get_tracks(result.tracklist)
         albumtype = ', '.join(
-            result.data['formats'][0].get('descriptions', [])) or None
-        va = result.data['artists'][0]['name'].lower() == 'various'
-        year = result.data['year']
-        label = result.data['labels'][0]['name']
+            result.formats[0].get('descriptions', [])) or None
+        va = result.artists[0].name.lower() == 'various'
+        year = result.year
+        label = result.labels[0].name
         mediums = len(set(t.medium for t in tracks))
         catalogno = result.data['labels'][0]['catno']
         if catalogno == 'none':
             catalogno = None
-        country = result.data.get('country')
-        media = result.data['formats'][0]['name']
-        data_url = result.data['uri']
+        country = result.country
+        media = result.formats[0]['name']
+        data_url = result.url
         return AlbumInfo(album, album_id, artist, artist_id, tracks, asin=None,
                          albumtype=albumtype, va=va, year=year, month=None,
                          day=None, label=label, mediums=mediums,
@@ -143,15 +152,15 @@ class DiscogsPlugin(BeetsPlugin):
         bits = []
         for artist in artists:
             if not artist_id:
-                artist_id = artist['id']
-            name = artist['name']
+                artist_id = artist.id
+            name = artist.name
             # Strip disambiguation number.
             name = re.sub(r' \(\d+\)$', '', name)
             # Move articles to the front.
             name = re.sub(r'(?i)^(.*?), (a|an|the)$', r'\2 \1', name)
             bits.append(name)
-            if artist['join']:
-                bits.append(artist['join'])
+            #if artist['join']:
+            #    bits.append(artist['join'])
         artist = ' '.join(bits).replace(' ,', ',') or None
         return artist, artist_id
 
@@ -163,11 +172,11 @@ class DiscogsPlugin(BeetsPlugin):
         index = 0
         for track in tracklist:
             # Only real tracks have `position`. Otherwise, it's an index track.
-            if track['position']:
+            if track.position:
                 index += 1
                 tracks.append(self.get_track_info(track, index))
             else:
-                index_tracks[index + 1] = track['title']
+                index_tracks[index + 1] = track.title
 
         # Fix up medium and medium_index for each track. Discogs position is
         # unreliable, but tracks are in order.
@@ -207,11 +216,11 @@ class DiscogsPlugin(BeetsPlugin):
     def get_track_info(self, track, index):
         """Returns a TrackInfo object for a discogs track.
         """
-        title = track['title']
+        title = track.title
         track_id = None
-        medium, medium_index = self.get_track_index(track['position'])
-        artist, artist_id = self.get_artist(track.get('artists', []))
-        length = self.get_track_length(track['duration'])
+        medium, medium_index = self.get_track_index(track.position)
+        artist, artist_id = self.get_artist(track.artists)
+        length = self.get_track_length(track.duration)
         return TrackInfo(title, track_id, artist, artist_id, length, index,
                          medium, medium_index, artist_sort=None,
                          disctitle=None, artist_credit=None)
